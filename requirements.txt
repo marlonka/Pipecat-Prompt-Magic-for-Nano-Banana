@@ -1,0 +1,4 @@
+pipecat-ai
+python-dotenv
+loguru
+google-generativeai
