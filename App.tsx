@@ -1,8 +1,8 @@
 
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { AppState, GeneratedImageData } from './types';
-import * as geminiService from './services/geminiService';
+import { pipecatService } from './services/pipecatService';
 import VoiceInputScreen from './components/VoiceInputScreen';
 import ImageDisplayScreen from './components/ImageDisplayScreen';
 import PromptIdeasScreen from './components/PromptIdeasScreen';
@@ -13,12 +13,72 @@ import Header from './components/Header';
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>({ screen: 'HOME', uploadedImages: [] });
   const [currentThought, setCurrentThought] = useState<string>('');
+  const [operationState, setOperationState] = useState<any>({});
+
+  useEffect(() => {
+    pipecatService.connect(() => {
+      console.log("Connected to Pipecat");
+    });
+
+    pipecatService.onMessage((message) => {
+      switch (message.type) {
+        case 'prompt_enhanced':
+          setAppState({ screen: 'GENERATING', phase: 'image' });
+          pipecatService.sendMessage({
+            action: 'generate_image',
+            prompt: message.magicPrompt,
+            aspectRatio: message.aspectRatio,
+          });
+          setOperationState({
+            ...operationState,
+            magicPrompt: message.magicPrompt,
+          });
+          break;
+        case 'image_generated':
+          setAppState({
+            screen: 'DISPLAY',
+            data: {
+              originalPrompt: operationState.originalPrompt,
+              magicPrompt: operationState.magicPrompt,
+              imageUrl: message.imageData,
+              baseImageUrl: null,
+            },
+          });
+          break;
+        case 'image_edited':
+          setAppState({
+            screen: 'DISPLAY',
+            data: {
+              originalPrompt: operationState.originalPrompt,
+              magicPrompt: operationState.magicPrompt,
+              imageUrl: message.imageData,
+              baseImageUrl: operationState.baseImageUrl,
+            },
+          });
+          break;
+        case 'transcription_complete':
+            pipecatService.sendMessage({
+                action: 'enhance_prompt',
+                originalPrompt: message.transcribedText,
+            });
+            setOperationState({
+                ...operationState,
+                originalPrompt: message.transcribedText,
+            });
+            break;
+      }
+    });
+
+    return () => {
+      pipecatService.disconnect();
+    };
+  }, [operationState]);
 
   const handleError = (error: any, message: string) => {
       console.error(error);
       setAppState({ screen: 'ERROR', message });
   }
-  
+
   const handleThoughtUpdate = (thought: string) => {
     setCurrentThought(prev => prev + thought);
   };
@@ -26,66 +86,42 @@ const App: React.FC = () => {
   const handleVoiceSubmit = useCallback(async (audioBlob: Blob) => {
     setAppState({ screen: 'GENERATING', phase: 'enhance' });
     setCurrentThought('');
-    try {
-      const { originalPrompt, magicPrompt, aspectRatio } = await geminiService.transcribeAndEnhancePrompt(audioBlob, handleThoughtUpdate);
-      setAppState({ screen: 'GENERATING', phase: 'image' });
-      const imageUrl = await geminiService.generateImage(magicPrompt, aspectRatio);
-      setAppState({
-        screen: 'DISPLAY',
-        data: { originalPrompt, magicPrompt, imageUrl, baseImageUrl: null }
-      });
-    } catch (error) {
-      handleError(error, 'Failed to generate image. Please try again.');
-    }
+    const reader = new FileReader();
+    reader.onloadend = () => {
+        const base64data = (reader.result as string).split(',')[1];
+        pipecatService.sendMessage({ action: 'transcribe', audioData: base64data });
+    };
+    reader.readAsDataURL(audioBlob);
   }, []);
 
   const handleTextSubmit = useCallback(async (text: string) => {
     setAppState({ screen: 'GENERATING', phase: 'enhance' });
     setCurrentThought('');
-    try {
-      const { magicPrompt, aspectRatio } = await geminiService.enhancePrompt(text, handleThoughtUpdate);
-      setAppState({ screen: 'GENERATING', phase: 'image' });
-      const imageUrl = await geminiService.generateImage(magicPrompt, aspectRatio);
-      setAppState({
-        screen: 'DISPLAY',
-        data: { originalPrompt: text, magicPrompt, imageUrl, baseImageUrl: null }
-      });
-    } catch (error) {
-      handleError(error, 'Failed to generate image. Please try again.');
-    }
+    setOperationState({ originalPrompt: text });
+    pipecatService.sendMessage({ action: 'enhance_prompt', originalPrompt: text });
   }, []);
   
   const handleImagePromptSubmit = useCallback(async (prompt: string, files: File[]) => {
     if (files.length === 0) return;
     setAppState({ screen: 'GENERATING', phase: 'enhance' });
     setCurrentThought('');
-    try {
-        const baseImage = files[0];
-        const contextImages = files.slice(1);
 
-        const { magicPrompt } = await geminiService.enhancePrompt(prompt, handleThoughtUpdate, true, baseImage, contextImages);
-
-        setAppState({ screen: 'GENERATING', phase: 'image' });
-        setCurrentThought(''); 
-
-        const newImageUrl = await geminiService.editImage(magicPrompt, baseImage, contextImages);
-        const baseImageUrl = URL.createObjectURL(baseImage);
-
-        setAppState({
-            screen: 'DISPLAY',
-            data: {
-                originalPrompt: prompt,
-                magicPrompt: magicPrompt,
-                imageUrl: newImageUrl,
-                baseImageUrl: baseImageUrl
-            }
-        });
-    } catch (error) {
-        handleError(error, 'Failed to edit image with prompt idea. Please try again.');
-    }
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64data = (reader.result as string).split(',')[1];
+      pipecatService.sendMessage({
+        action: 'edit_image',
+        prompt: prompt,
+        baseImage: base64data,
+      });
+    };
+    reader.readAsDataURL(files[0]);
+    setOperationState({
+      originalPrompt: prompt,
+      baseImageUrl: URL.createObjectURL(files[0]),
+    });
   }, []);
   
-  // FIX: Create a wrapper to handle single file submissions from PromptIdeasScreen.
   const handleSingleImagePromptSubmit = useCallback((prompt: string, file: File) => {
     handleImagePromptSubmit(prompt, [file]);
   }, [handleImagePromptSubmit]);
@@ -94,66 +130,61 @@ const App: React.FC = () => {
     if (files.length === 0) return;
     setAppState({ screen: 'GENERATING', phase: 'enhance' });
     setCurrentThought('');
-    try {
-      const baseImage = files[0];
-      const contextImages = files.slice(1);
-      
-      const { originalPrompt, magicPrompt } = await geminiService.transcribeAndEnhancePrompt(audioBlob, handleThoughtUpdate, true, baseImage, contextImages);
 
-      setAppState({ screen: 'GENERATING', phase: 'image' });
-      setCurrentThought('');
-
-      const newImageUrl = await geminiService.editImage(magicPrompt, baseImage, contextImages);
-      const baseImageUrl = URL.createObjectURL(baseImage);
-
-      setAppState({
-          screen: 'DISPLAY',
-          data: {
-              originalPrompt,
-              magicPrompt,
-              imageUrl: newImageUrl,
-              baseImageUrl: baseImageUrl
-          }
-      });
-    } catch (error) {
-       handleError(error, 'Failed to edit image. Please try again.');
-    }
+    const audioReader = new FileReader();
+    audioReader.onloadend = () => {
+      const audioBase64 = (audioReader.result as string).split(',')[1];
+      const imageReader = new FileReader();
+      imageReader.onloadend = () => {
+        const imageBase64 = (imageReader.result as string).split(',')[1];
+        pipecatService.sendMessage({
+          action: 'edit_image',
+          audioData: audioBase64,
+          baseImage: imageBase64,
+        });
+      };
+      imageReader.readAsDataURL(files[0]);
+    };
+    audioReader.readAsDataURL(audioBlob);
+    setOperationState({
+      baseImageUrl: URL.createObjectURL(files[0]),
+    });
   }, []);
 
   const handleEditSubmit = useCallback(async (audioBlob: Blob | null, text: string | null, editData: GeneratedImageData, editImages: File[] | null) => {
     setAppState({ screen: 'GENERATING', phase: 'enhance' });
     setCurrentThought('');
-     try {
-      let originalPrompt: string, magicPrompt: string;
-      
-      const baseImageBlob = await fetch(editData.imageUrl).then(r => r.blob());
-      const promptImageBlobs = editImages || [];
+
+    const baseImageBlob = await fetch(editData.imageUrl).then(r => r.blob());
+    const baseImageReader = new FileReader();
+    baseImageReader.onloadend = () => {
+      const baseImageBase64 = (baseImageReader.result as string).split(',')[1];
+      let promptData: any = {
+        action: 'edit_image',
+        baseImage: baseImageBase64,
+      };
 
       if (audioBlob) {
-          ({ originalPrompt, magicPrompt } = await geminiService.transcribeAndEnhancePrompt(audioBlob, handleThoughtUpdate, true, baseImageBlob, promptImageBlobs));
+        const audioReader = new FileReader();
+        audioReader.onloadend = () => {
+          promptData.audioData = (audioReader.result as string).split(',')[1];
+          pipecatService.sendMessage(promptData);
+        };
+        audioReader.readAsDataURL(audioBlob);
       } else if (text) {
-          ({ originalPrompt, magicPrompt } = await geminiService.enhancePrompt(text, handleThoughtUpdate, true, baseImageBlob, promptImageBlobs));
-      } else if (promptImageBlobs.length > 0) {
-          // Allow submitting with only images
-          originalPrompt = '';
-          ({ magicPrompt } = await geminiService.enhancePrompt('', handleThoughtUpdate, true, baseImageBlob, promptImageBlobs));
-      }
-      else {
+        promptData.prompt = text;
+        pipecatService.sendMessage(promptData);
+      } else if (editImages && editImages.length > 0) {
+        // Handle additional images if necessary
+        pipecatService.sendMessage(promptData);
+      } else {
         throw new Error("No input provided for editing.");
       }
-      
-      setAppState({ screen: 'GENERATING', phase: 'image' });
-      setCurrentThought('');
-      
-      const newImageUrl = await geminiService.editImage(magicPrompt, baseImageBlob, promptImageBlobs);
-
-      setAppState({
-        screen: 'DISPLAY',
-        data: { originalPrompt, magicPrompt, imageUrl: newImageUrl, baseImageUrl: editData.imageUrl }
-      });
-    } catch (error) {
-       handleError(error, 'Failed to edit image. Please try again.');
-    }
+    };
+    baseImageReader.readAsDataURL(baseImageBlob);
+    setOperationState({
+      baseImageUrl: editData.imageUrl,
+    });
   }, []);
 
   const handleImageUpload = (files: File[]) => {
